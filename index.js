@@ -20,7 +20,11 @@ import { homedir } from 'node:os'
 import { dirname, basename, join, resolve, relative } from 'node:path'
 
 export const name = 'easy-paint'
-export const inject = ['tools']
+// webServer 必须声明在这里：Cordis 只会在 inject 列出的服务就绪后才执行 apply，
+// 也只有列出来的服务才能被 ctx.inject() 等待到。原先只写了 'tools'，又用
+// ctx.inject(['webServer']) 去等——回调永远不触发，设置页的路由一个都没注册上，
+// 前端拿到的就是 HTTP 404。
+export const inject = ['tools', 'webServer']
 
 /** 画幅 → 像素。边长均为 16 的倍数，总像素贴近 1MP。 */
 /** 画幅预设：SDXL 与 Qwen 共用同一套比例 */
@@ -1916,11 +1920,14 @@ export function apply(ctx, rawConfig) {
 
   // 出图自检依赖的服务：attachments 用于把图存成可引用的附件，llm 用于视觉检查。
   // 两者都可能不存在（profile 差异），缺了就降级跳过，不影响出图本身。
+  // attachments / llm 不写进 inject：它们是「有就用、没有就降级」的服务。
+  // 用 ctx.inject() 的回调形式等待——这两个服务在 dsh-web-app 里一定有，
+  // 等到了就填进去，等不到则自检和识图走「缺服务」分支，出图不受影响。
   const checkServices = { attachments: null, llm: null }
   if (typeof ctx.inject === 'function') {
     ctx.inject(['attachments', 'llm'], (sub) => {
-      checkServices.attachments = sub.attachments ?? null
-      checkServices.llm = sub.llm ?? null
+      checkServices.attachments = sub?.attachments ?? null
+      checkServices.llm = sub?.llm ?? null
     })
   }
   /** 自检进行中标记：出图已完成但还在检查，状态座据此显示「自检中」。 */
@@ -2112,7 +2119,8 @@ async function generateImageUnlocked(args, exec) {
           seeds: shots.map((shot) => shot.seed),
           checks: shots.map((shot) => shot.selfCheck),
             // 自检未通过那些图的附件引用：render 用它把图贴出来；没有失败项就是 null。
-            previews: shots.map((shot) => shot.preview),
+            // 没有预览的项用空对象占位——schema 声明的是 array of object，灌 null 会校验不过
+            previews: shots.map((shot) => shot.preview ?? {}),
           width: lastWorkflow.width,
           height: lastWorkflow.height,
           steps: lastWorkflow.steps,
@@ -2183,7 +2191,9 @@ async function generateImageUnlocked(args, exec) {
           paths: { type: 'array', items: { type: 'string' } },
           seeds: { type: 'array', items: { type: 'number' } },
           checks: { type: 'array', items: { type: 'object', additionalProperties: true } },
-            previews: { type: 'array', items: { type: ['object', 'null'], additionalProperties: true } },
+            // 用 array of object 而不是 [object, null] 联合类型：DSH 的 schema 校验只认单一 type 字符串，
+            // 写联合类型会让整个工具注册失败，apply 直接中断，后面的路由一条都注册不上。
+            previews: { type: 'array', items: { type: 'object', additionalProperties: true } },
           width: { type: 'number' },
           height: { type: 'number' },
           steps: { type: 'number' },
@@ -2295,7 +2305,8 @@ async function generateImageUnlocked(args, exec) {
         // 得让他看到画面。previews 是 generateImage 提前存好的附件引用（render 是同步的）。
         const previews = Array.isArray(value.previews) ? value.previews : []
         for (const ref of previews) {
-          if (ref) out.push({ type: 'image', attachment: ref })
+          // 没预览的位置是空对象，跳过
+          if (ref && Object.keys(ref).length > 0) out.push({ type: 'image', attachment: ref })
         }
         return out
       },
@@ -3195,26 +3206,23 @@ async function generateImageUnlocked(args, exec) {
       respondJson(res, 200, { ok: false, error: msg })
     }
   }
-  // webServer 是可选服务：没有它的 profile 里插件照常出图，只是设置页读写不了。
-  if (typeof ctx.inject === 'function') {
-    ctx.inject(['webServer'], (webCtx) => {
-      webCtx.effect(() => {
-        const disposers = [
-          webCtx.webServer.register({ kind: 'exact', path: CONFIG_PATH, handler: onConfig }),
-          webCtx.webServer.register({ kind: 'exact', path: STATUS_PATH, handler: onStatus }),
-          webCtx.webServer.register({ kind: 'exact', path: MODELS_PATH, handler: onModels }),
-          webCtx.webServer.register({ kind: 'exact', path: LAUNCH_PATH, handler: onLaunch }),
-          webCtx.webServer.register({ kind: 'exact', path: STOP_PATH, handler: onStop }),
-          webCtx.webServer.register({ kind: 'exact', path: VISION_MODELS_PATH, handler: onVisionModels }),
-          webCtx.webServer.register({ kind: 'exact', path: DETECT_PATH, handler: onDetect }),
-          webCtx.webServer.register({ kind: 'exact', path: BROWSE_PATH, handler: onBrowse }),
-          webCtx.webServer.register({ kind: 'exact', path: DRAW_PATH, handler: onDraw }),
-          webCtx.webServer.register({ kind: 'exact', path: IMAGE_PATH, handler: onImage }),
-          webCtx.webServer.register({ kind: 'exact', path: REVEAL_PATH, handler: onReveal }),
-          webCtx.webServer.register({ kind: 'exact', path: OPEN_OUTPUT_PATH, handler: onOpenOutput }),
-        ]
-        return () => { for (const dispose of disposers) dispose() }
-      }, 'easy-paint: config, status, models, launch, stop and vision-models routes')
-    })
-  }
+  // 设置页要用的 HTTP 路由。webServer 已在 inject 里声明，走到这里它一定就绪，
+  // 直接同步注册即可（和 dsh-archive-manager 等插件同一套写法）。
+  ctx.effect(() => {
+    const disposers = [
+      ctx.webServer.register({ kind: 'exact', path: CONFIG_PATH, handler: onConfig }),
+      ctx.webServer.register({ kind: 'exact', path: STATUS_PATH, handler: onStatus }),
+      ctx.webServer.register({ kind: 'exact', path: MODELS_PATH, handler: onModels }),
+      ctx.webServer.register({ kind: 'exact', path: LAUNCH_PATH, handler: onLaunch }),
+      ctx.webServer.register({ kind: 'exact', path: STOP_PATH, handler: onStop }),
+      ctx.webServer.register({ kind: 'exact', path: VISION_MODELS_PATH, handler: onVisionModels }),
+      ctx.webServer.register({ kind: 'exact', path: DETECT_PATH, handler: onDetect }),
+      ctx.webServer.register({ kind: 'exact', path: BROWSE_PATH, handler: onBrowse }),
+      ctx.webServer.register({ kind: 'exact', path: DRAW_PATH, handler: onDraw }),
+      ctx.webServer.register({ kind: 'exact', path: IMAGE_PATH, handler: onImage }),
+      ctx.webServer.register({ kind: 'exact', path: REVEAL_PATH, handler: onReveal }),
+      ctx.webServer.register({ kind: 'exact', path: OPEN_OUTPUT_PATH, handler: onOpenOutput }),
+    ]
+    return () => { for (const dispose of disposers) dispose() }
+  }, 'easy-paint: settings routes')
 }

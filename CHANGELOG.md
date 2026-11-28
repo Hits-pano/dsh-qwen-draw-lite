@@ -21,6 +21,33 @@
 
 ---
 
+## [0.5.5] - 2026-11-28
+
+修复一个让设置页彻底失效的 schema 错误。
+
+### 修复
+
+**设置页报 HTTP 404、插件页报 schema 异常**
+
+0.5.4 给 draw_image 加了一条 `previews` 字段，schema 写成：
+
+```js
+previews: { type: 'array', items: { type: ['object', 'null'], additionalProperties: true } }
+```
+
+DSH 的 JSON Schema 校验不接受联合类型：
+
+```
+unsupported JSON schema: schema.properties.previews.items.type
+must be a single type string (type arrays are not supported)
+```
+
+而 `ctx.tools.register()` 是在 apply() 里同步调用的——它一抛错，apply 直接中断，后面 12 条设置页路由一行都没执行。表现就是设置页打开全是 404，插件详情页也报同一个 schema 错。
+
+改成单一类型 `type: 'object'`，没有预览的项用空对象占位，render 里跳过空对象。全文再没有一处 `type: [...]`。
+
+---
+
 ## [0.5.4] - 2026-11-28
 
 自检没通过时，让用户看得见图、也让模型别自作主张重画。

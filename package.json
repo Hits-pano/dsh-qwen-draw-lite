@@ -1,6 +1,6 @@
 {
   "name": "dsh-easy-paint",
-  "version": "0.5.4",
+  "version": "0.5.5",
   "description": "用本机 ComfyUI 生成图片的插件，支持 Qwen-Image / SDXL / Z-Image 三套架构切换",
   "keywords": [
     "deepseek-harness",
